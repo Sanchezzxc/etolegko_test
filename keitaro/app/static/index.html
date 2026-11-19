@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Keitaro — кампании</title>
+  <link rel="stylesheet" href="/static/style.css?v=3">
+</head>
+<body>
+<header class="top">
+  <span class="brand">Keitaro wrapper</span>
+  <a href="/" class="active">Кампании</a>
+  <a href="/docs" target="_blank">API docs</a>
+</header>
+
+<main class="grid">
+  <!-- Creator -->
+  <section class="card">
+    <h2>Новая кампания</h2>
+    <form id="create-form" autocomplete="off">
+      <label for="name">Название</label>
+      <div class="prefix-input"><span id="prefix">test_</span><input id="name" required placeholder="campaign1"></div>
+
+      <label>Гео <span class="hint">— код страны, можно несколько</span></label>
+      <div class="ac">
+        <div class="chips" id="geo-chips"><input id="geo-input" placeholder="AU, MX, RO…"></div>
+      </div>
+
+      <label for="offer-input">Оффер</label>
+      <div class="ac"><input id="offer-input" placeholder="Поиск по ID или названию"></div>
+      <div class="selected-offer" id="offer-selected"></div>
+
+      <label for="domain">Домен</label>
+      <select id="domain"></select>
+      <label for="group">Группа</label>
+      <select id="group"></select>
+      <label for="source">Источник</label>
+      <select id="source"></select>
+
+      <button class="primary btn-block" id="create-btn" type="submit">Create</button>
+      <div class="msg" id="create-msg"></div>
+    </form>
+  </section>
+
+  <!-- Campaign list -->
+  <section class="card">
+    <div class="toolbar">
+      <h2 style="margin:0">Кампании в Keitaro</h2>
+      <div class="row">
+        <input id="camp-search" placeholder="Поиск" style="width:200px">
+        <label class="row" style="margin:0;font-weight:400;white-space:nowrap"><input type="checkbox" id="only-mine" checked style="width:auto"> только мои</label>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>ID</th><th>Название</th><th>Статус</th><th></th></tr></thead>
+      <tbody id="camp-list"><tr><td colspan="4" class="muted"><span class="spinner"></span> Загрузка…</td></tr></tbody>
+    </table>
+  </section>
+</main>
+
+<script src="/static/common.js?v=3"></script>
+<script>
+const state = { countries: [], geo: [], offer: null };
+
+// ---- options (domain / group / source) ----
+function fillSelect(el, items, selected) {
+  el.innerHTML = `<option value="">— выберите —</option>` +
+    items.map(i => `<option value="${i.id}" ${i.id === selected ? "selected" : ""}>${esc(i.name)}</option>`).join("");
+}
+async function loadOptions() {
+  try {
+    const o = await api("/api/options");
+    document.getElementById("prefix").textContent = o.name_prefix || "";
+    fillSelect(domain, o.domains, o.default_domain_id);
+    fillSelect(group, o.groups, o.default_group_id);
+    fillSelect(source, o.traffic_sources, o.default_traffic_source_id);
+  } catch (e) { showMsg(e.message, true); }
+}
+
+// ---- geo chips ----
+function renderGeo() {
+  const chips = document.getElementById("geo-chips");
+  chips.querySelectorAll(".chip").forEach(c => c.remove());
+  const input = document.getElementById("geo-input");
+  state.geo.forEach(code => {
+    const c = document.createElement("span");
+    c.className = "chip";
+    c.innerHTML = `${code}<button type="button" title="Убрать">&times;</button>`;
+    c.querySelector("button").onclick = () => { state.geo = state.geo.filter(g => g !== code); renderGeo(); };
+    chips.insertBefore(c, input);
+  });
+}
+function addGeo(code) {
+  code = code.trim().toUpperCase();
+  if (!state.countries.some(c => c.code === code)) return false;
+  if (!state.geo.includes(code)) state.geo.push(code);
+  renderGeo();
+  return true;
+}
+const geoInput = document.getElementById("geo-input");
+autocomplete(geoInput, {
+  source: async q => {
+    q = q.toLowerCase();
+    const rank = c => c.code.toLowerCase() === q ? 0 : c.name.toLowerCase().startsWith(q) ? 1 : c.code.toLowerCase().startsWith(q) ? 2 : 3;
+    return state.countries
+      .filter(c => !state.geo.includes(c.code) && (!q || c.code.toLowerCase().startsWith(q) || c.name.toLowerCase().includes(q)))
+      .sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name))
+      .slice(0, 12);
+  },
+  render: c => `<span class="id">${c.code}</span>${esc(c.name)}`,
+  onPick: c => { addGeo(c.code); geoInput.value = ""; },
+});
+// "MX,AU RO" typed or pasted -> chips; unknown codes stay in the input
+geoInput.addEventListener("input", () => {
+  if (!/[,;\s]/.test(geoInput.value)) return;
+  const tokens = geoInput.value.split(/[,;\s]+/);
+  const tail = tokens.pop();
+  const rejected = tokens.filter(t => t && !addGeo(t));
+  geoInput.value = [...rejected, tail].join(rejected.length ? "," : "");
+});
+geoInput.addEventListener("keydown", e => {
+  if (e.key === "Backspace" && !geoInput.value && state.geo.length) { state.geo.pop(); renderGeo(); }
+});
+document.getElementById("geo-chips").addEventListener("click", () => geoInput.focus());
+
+// ---- offer autocomplete ----
+const offerInput = document.getElementById("offer-input");
+const offerSelected = document.getElementById("offer-selected");
+function setOffer(o) {
+  state.offer = o;
+  if (!o) { offerSelected.style.display = "none"; return; }
+  offerSelected.innerHTML = `<span>${renderOffer(o)}</span><button type="button" class="danger" title="Сбросить">&times;</button>`;
+  offerSelected.style.display = "flex";
+  offerSelected.querySelector("button").onclick = () => setOffer(null);
+  offerInput.value = "";
+}
+autocomplete(offerInput, { source: searchOffers, render: renderOffer, onPick: setOffer });
+
+// ---- submit ----
+function showMsg(text, isErr) {
+  const m = document.getElementById("create-msg");
+  m.className = "msg " + (isErr ? "err" : "ok");
+  m.innerHTML = text;
+}
+document.getElementById("create-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  if (geoInput.value.trim()) { addGeo(geoInput.value); geoInput.value = ""; }
+  if (!state.geo.length) return showMsg("Укажите хотя бы одну страну", true);
+  if (!state.offer) return showMsg("Выберите оффер из списка", true);
+  const btn = document.getElementById("create-btn");
+  btn.disabled = true; btn.innerHTML = `<span class="spinner"></span> Создаём…`;
+  try {
+    const c = await api("/api/campaigns", {
+      method: "POST",
+      body: {
+        name: document.getElementById("name").value,
+        countries: state.geo,
+        offer_id: state.offer.id,
+        domain_id: +domain.value || null,
+        group_id: +group.value || null,
+        traffic_source_id: +source.value || null,
+      },
+    });
+    showMsg(`Кампания <b>${esc(c.name)}</b> создана (ID ${c.keitaro_id}).<br>` +
+      (c.url ? `URL: <a href="${esc(c.url)}" target="_blank">${esc(c.url)}</a><br>` : "") +
+      `<a href="/campaign/${c.keitaro_id}">Открыть редактор →</a>`, false);
+    document.getElementById("name").value = "";
+    state.geo = []; renderGeo(); setOffer(null);
+    loadCampaigns();
+  } catch (err) {
+    showMsg(esc(err.message), true);
+  } finally {
+    btn.disabled = false; btn.textContent = "Create";
+  }
+});
+
+// ---- campaign list ----
+async function loadCampaigns() {
+  const body = document.getElementById("camp-list");
+  const q = document.getElementById("camp-search").value;
+  const mine = document.getElementById("only-mine").checked;
+  try {
+    const list = await api(`/api/campaigns?mine=${mine}&q=${encodeURIComponent(q)}`);
+    body.innerHTML = list.length ? list.map(c => `
+      <tr>
+        <td class="muted">${c.id}</td>
+        <td><a href="/campaign/${c.id}">${esc(c.name)}</a></td>
+        <td><span class="badge ${c.state === "active" ? "active" : ""}">${esc(c.state)}</span></td>
+        <td class="num"><a href="/campaign/${c.id}">Редактировать</a></td>
+      </tr>`).join("") : `<tr><td colspan="4" class="muted">Кампаний нет</td></tr>`;
+  } catch (e) {
+    body.innerHTML = `<tr><td colspan="4" class="msg err" style="display:table-cell">${esc(e.message)}</td></tr>`;
+  }
+}
+document.getElementById("camp-search").addEventListener("input", debounce(loadCampaigns, 300));
+document.getElementById("only-mine").addEventListener("change", loadCampaigns);
+
+const domain = document.getElementById("domain");
+const group = document.getElementById("group");
+const source = document.getElementById("source");
+api("/api/countries").then(c => state.countries = c);
+loadOptions();
+loadCampaigns();
+</script>
+</body>
+</html>

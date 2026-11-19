@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Keitaro — редактор кампании</title>
+  <link rel="stylesheet" href="/static/style.css?v=3">
+</head>
+<body>
+<header class="top">
+  <span class="brand">Keitaro wrapper</span>
+  <a href="/">Кампании</a>
+  <a href="/docs" target="_blank">API docs</a>
+</header>
+
+<main>
+  <div class="card" style="margin-bottom:16px">
+    <div class="toolbar" style="margin:0">
+      <div>
+        <h1 id="c-name">Загрузка…</h1>
+        <div class="muted" id="c-meta"></div>
+      </div>
+      <div class="row">
+        <select id="interval" style="width:auto">
+          <option value="today">Сегодня</option>
+          <option value="yesterday">Вчера</option>
+          <option value="7_days_ago">7 дней</option>
+          <option value="first_day_of_this_month">Этот месяц</option>
+          <option value="1_month_ago">30 дней</option>
+          <option value="all_time">Всё время</option>
+        </select>
+        <button class="ghost" id="refresh" title="Обновить">⟳</button>
+      </div>
+    </div>
+    <div class="url-box" id="url-box" style="display:none">
+      <input id="c-url" readonly>
+      <button class="ghost" id="copy-url">Копировать</button>
+    </div>
+  </div>
+
+  <div class="totals" id="totals"></div>
+  <div class="msg err" id="stats-error" style="display:none"></div>
+  <div id="streams"></div>
+
+  <div class="card">
+    <h2>История изменений</h2>
+    <ul class="history" id="history"><li class="muted">—</li></ul>
+  </div>
+</main>
+
+<script src="/static/common.js?v=3"></script>
+<script>
+const campaignId = +location.pathname.split("/").pop();
+const intervalEl = document.getElementById("interval");
+let view = null;
+const editing = {}; // streamId -> {offerId: share} while the user edits shares manually
+
+const ACTION_LABELS = { add: "добавлен оффер", remove: "удалён оффер", set_shares: "изменены доли" };
+const fmt = n => Number(n || 0).toLocaleString("ru-RU");
+
+function filtersText(filters) {
+  return filters.map(f => {
+    const mode = f.mode === "reject" ? "отклонять" : "принимать";
+    const payload = Array.isArray(f.payload) ? f.payload.join(", ") : JSON.stringify(f.payload);
+    const name = f.name === "country" ? "Страны" : f.name;
+    return `${esc(name)} ${mode} "${esc(payload)}"`;
+  }).join("<br>");
+}
+
+function streamStatsCells(s) {
+  return `<span class="num">${fmt(s.clicks)}</span><span class="num">${fmt(s.unique)}</span><span class="num">${fmt(s.bots)}</span>`;
+}
+
+function renderOffersTable(st) {
+  const edit = editing[st.id];
+  const total = edit ? Object.values(edit).reduce((a, b) => a + (+b || 0), 0) : st.share_total;
+  const rows = st.offers.map(o => `
+    <tr>
+      <td><span class="muted">[${o.offer_id}]</span> ${esc(o.name)}</td>
+      <td class="num">${edit
+        ? `<input class="share-input" type="number" min="0" max="100" data-stream="${st.id}" data-offer="${o.offer_id}" value="${edit[o.offer_id]}">`
+        : `<b style="color:var(--accent)">${o.share}%</b>`}</td>
+      <td class="num">${fmt(o.stats.clicks)}</td>
+      <td class="num">${fmt(o.stats.unique)}</td>
+      <td class="num">${fmt(o.stats.conversions)}</td>
+      <td class="num">${o.stats.revenue.toFixed(2)}</td>
+      <td class="num"><button class="danger" data-remove="${o.offer_id}" data-stream="${st.id}"
+        ${st.offers.length <= 1 ? 'disabled title="Нельзя удалить последний оффер"' : 'title="Удалить оффер"'}>✕</button></td>
+    </tr>`).join("");
+  return `
+    <table class="offers">
+      <thead><tr><th>Оффер</th><th class="num">Доля</th><th class="num">Клики</th><th class="num">Уник.</th><th class="num">Конв.</th><th class="num">Доход</th><th></th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="7" class="muted">Офферов нет</td></tr>`}</tbody>
+      <tfoot><tr>
+        <td class="muted">Итого</td>
+        <td class="num"><span class="share-total ${total === 100 ? "" : "bad"}" id="total-${st.id}">${total}%</span></td>
+        <td colspan="5" class="num">
+          ${edit
+            ? `<button class="ghost" data-cancel="${st.id}">Отмена</button> <button class="primary" data-save="${st.id}">Сохранить доли</button>`
+            : `<button class="ghost" data-edit="${st.id}" ${st.offers.length < 2 ? "disabled" : ""}>Изменить доли</button>`}
+        </td>
+      </tr></tfoot>
+    </table>
+    <div class="add-offer">
+      <div class="ac"><input placeholder="Добавить оффер: поиск по ID или названию" data-add-input="${st.id}"></div>
+    </div>`;
+}
+
+function render() {
+  const c = view.campaign;
+  document.title = `${c.name} — редактор`;
+  document.getElementById("c-name").textContent = c.name;
+  document.getElementById("c-meta").innerHTML =
+    `ID ${c.id} · alias <b>${esc(c.alias)}</b> · <span class="badge ${c.state === "active" ? "active" : ""}">${esc(c.state)}</span>`;
+  if (c.url) {
+    document.getElementById("url-box").style.display = "flex";
+    document.getElementById("c-url").value = c.url;
+  }
+
+  const t = view.totals;
+  document.getElementById("totals").innerHTML = [
+    ["Клики", fmt(t.clicks)], ["Уникальные", fmt(t.unique)], ["Боты", fmt(t.bots)],
+    ["Конверсии", fmt(t.conversions)], ["Доход", t.revenue.toFixed(2)],
+  ].map(([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+
+  const u = view.unattributed;
+  const se = document.getElementById("stats-error");
+  se.style.display = view.stats_error || (u && u.clicks) ? "block" : "none";
+  se.className = "msg " + (view.stats_error ? "err" : "ok");
+  se.textContent = view.stats_error
+    ? `Статистика недоступна: ${view.stats_error}`
+    : u && u.clicks ? `Вне потоков (не попали ни в один поток, в т.ч. боты): ${fmt(u.clicks)} кликов, ${fmt(u.bots)} ботов — входят в итоги кампании.` : "";
+
+  document.getElementById("streams").innerHTML = view.streams.map(st => `
+    <div class="card stream">
+      <div class="stream-head">
+        <div class="title"><span class="dot">●</span> ${esc(st.name)}
+          <span class="badge">#${st.id}</span> <span class="badge">${esc(st.type || "")}</span></div>
+        <span class="cap">Клики</span><span class="cap">Уник.</span><span class="cap">Боты</span>
+      </div>
+      <div class="stream-head" style="margin-top:2px">
+        <div class="stream-meta">${st.schema === "redirect" || (!st.is_offer_stream && st.action_payload)
+          ? `Редирект → <a href="${esc(st.action_payload)}" target="_blank">${esc(st.action_payload)}</a>`
+          : st.is_offer_stream ? "Офферы" : esc(st.schema || "")}</div>
+        ${streamStatsCells(st.stats)}
+      </div>
+      ${st.filters.length ? `<div class="stream-meta">Фильтры:<br><span class="filters">${filtersText(st.filters)}</span></div>` : ""}
+      ${st.is_offer_stream ? renderOffersTable(st) : ""}
+    </div>`).join("") || `<div class="card muted">В кампании нет потоков</div>`;
+
+  document.querySelectorAll("[data-add-input]").forEach(input => {
+    const streamId = +input.dataset.addInput;
+    const stream = view.streams.find(s => s.id === streamId);
+    autocomplete(input, {
+      source: async q => (await searchOffers(q)).filter(o => !stream.offers.some(x => x.offer_id === o.id)),
+      render: renderOffer,
+      onPick: o => addOffer(streamId, o),
+    });
+  });
+}
+
+async function load() {
+  try {
+    view = await api(`/api/campaigns/${campaignId}?interval=${intervalEl.value}`);
+    render();
+  } catch (e) {
+    document.getElementById("c-name").textContent = "Ошибка";
+    toast(e.message, true);
+  }
+  loadHistory();
+}
+
+async function loadHistory() {
+  try {
+    const h = await api(`/api/campaigns/${campaignId}/history`);
+    document.getElementById("history").innerHTML = h.length ? h.map(x => `
+      <li><span class="muted">${new Date(x.created_at).toLocaleString("ru-RU")}</span> —
+        поток #${x.stream_id}: ${ACTION_LABELS[x.action] || x.action}${x.offer_id ? ` #${x.offer_id}` : ""}
+        <span class="muted">(${x.offers_after.map(o => `#${o.offer_id}: ${o.share}%`).join(", ")})</span></li>`).join("")
+      : `<li class="muted">Изменений через этот сервис ещё не было</li>`;
+  } catch (_) { /* history is optional */ }
+}
+
+async function mutate(promise, okText) {
+  document.body.style.cursor = "progress";
+  try {
+    await promise;
+    toast(okText);
+    await load();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    document.body.style.cursor = "";
+  }
+}
+
+function addOffer(streamId, offer) {
+  delete editing[streamId];
+  mutate(api(`/api/campaigns/${campaignId}/streams/${streamId}/offers`, { method: "POST", body: { offer_id: offer.id } }),
+    `Оффер [${offer.id}] добавлен, доли пересчитаны`);
+}
+
+document.getElementById("streams").addEventListener("click", e => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  if (b.dataset.remove) {
+    const streamId = +b.dataset.stream, offerId = +b.dataset.remove;
+    if (!confirm(`Удалить оффер [${offerId}] из потока? Доли оставшихся будут пересчитаны.`)) return;
+    delete editing[streamId];
+    mutate(api(`/api/campaigns/${campaignId}/streams/${streamId}/offers/${offerId}`, { method: "DELETE" }),
+      `Оффер [${offerId}] удалён`);
+  } else if (b.dataset.edit) {
+    const st = view.streams.find(s => s.id === +b.dataset.edit);
+    editing[st.id] = Object.fromEntries(st.offers.map(o => [o.offer_id, o.share]));
+    render();
+  } else if (b.dataset.cancel) {
+    delete editing[+b.dataset.cancel];
+    render();
+  } else if (b.dataset.save) {
+    const streamId = +b.dataset.save;
+    const offers = Object.entries(editing[streamId]).map(([offer_id, share]) => ({ offer_id: +offer_id, share: +share || 0 }));
+    const total = offers.reduce((a, o) => a + o.share, 0);
+    if (total !== 100) return toast(`Сумма долей должна быть 100%, сейчас ${total}%`, true);
+    delete editing[streamId];
+    mutate(api(`/api/campaigns/${campaignId}/streams/${streamId}/shares`, { method: "PUT", body: { offers } }), "Доли сохранены");
+  }
+});
+
+document.getElementById("streams").addEventListener("input", e => {
+  const inp = e.target.closest(".share-input");
+  if (!inp) return;
+  const sid = +inp.dataset.stream;
+  editing[sid][inp.dataset.offer] = +inp.value || 0;
+  const total = Object.values(editing[sid]).reduce((a, b) => a + b, 0);
+  const el = document.getElementById(`total-${sid}`);
+  el.textContent = `${total}%`;
+  el.classList.toggle("bad", total !== 100);
+});
+
+document.getElementById("copy-url").onclick = () => {
+  navigator.clipboard.writeText(document.getElementById("c-url").value).then(() => toast("Скопировано"));
+};
+intervalEl.addEventListener("change", load);
+document.getElementById("refresh").onclick = load;
+load();
+</script>
+</body>
+</html>
